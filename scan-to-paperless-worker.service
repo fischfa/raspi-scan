@@ -1,0 +1,13 @@
+[Unit]
+Description=scan-to-paperless background worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/scan-to-paperless.sh worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
