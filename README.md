@@ -4,7 +4,8 @@ Dieses Dokument beschreibt ein **funktionierendes, verifiziertes Setup** für ei
 
 - Scan per **Taste am Scanner** über `scanbd`
 - Scan per **ADF Duplex**
-- PDF-Erzeugung auf dem Raspberry Pi
+- schnelle Rückkehr des Scanners in den Bereitschaftszustand durch **Queueing**
+- PDF-Erzeugung auf dem Raspberry Pi in einem **separaten Worker**
 - Upload in den **Paperless-ngx consume**-Ordner über einen **auf dem Pi gemounteten NFS-Pfad**
 - OCR, Tags und Zuordnung anschließend in **Paperless-ngx**
 
@@ -22,11 +23,12 @@ Ablauf:
 2. Scan-Taste am Fujitsu drücken
 3. `scanbd` erkennt den Tastendruck
 4. `scanbd` startet das Script `/usr/local/bin/scan-to-paperless.sh`
-5. Das Script scannt per `scanimage`
-6. Das Script erzeugt ein PDF
-7. Das PDF wird bei Bedarf gedreht und in die richtige Seitenreihenfolge gebracht
-8. Das PDF wird in den per NFS gemounteten Paperless-Consume-Ordner geschrieben
-9. Paperless importiert und OCRt das Dokument
+5. Das Script scannt per `scanimage` nur die **rohen TIFF-Seiten** und legt einen Job in der Queue an
+6. Der Scanner ist danach wieder frei, sobald der physische Einzug beendet ist
+7. Ein separater `systemd`-Worker verarbeitet die Queue FIFO
+8. Der Worker erzeugt das PDF, dreht es bei Bedarf und korrigiert die Seitenreihenfolge
+9. Der Worker schreibt das PDF in den per NFS gemounteten Paperless-Consume-Ordner
+10. Paperless importiert und OCRt das Dokument
 
 ### Verifizierte Besonderheiten dieses Setups
 
@@ -37,10 +39,11 @@ Diese Punkte wurden in der Inbetriebnahme praktisch beobachtet und sind im READM
 - `scanbd` funktionierte erst zuverlässig, nachdem es ein **eigenes SANE-Konfigurationsverzeichnis** bekommen hat und der Dienst mit `SANE_CONFIG_DIR=/etc/scanbd/sane.d` lief. Genau dieses getrennte Setup wird vom `scanbd`-Projekt für Desktop-/Client-Umgebungen beschrieben. citeturn800767search0turn265542search1turn270230search1
 - Die Standard-`scanbd.conf` triggert oft noch `test.script`; das muss auf das echte Script umgestellt werden.
 - Der `scanbd`-Button-Trigger funktionierte, nachdem `scanbd` den Fujitsu aus **`/etc/scanbd/sane.d`** sehen konnte.
-- Der Script-Lock darf nicht unter `/run/...` liegen, wenn das Script unter `scanbd` als `saned:scanner` läuft. Ein Lock in `/var/lib/scan-to-paperless/...` war in diesem Setup die funktionierende Lösung.
+- Der Scan-Lock darf nicht unter `/run/...` liegen, wenn das Script unter `scanbd` als `saned:scanner` läuft. Ein Lock in `/var/lib/scan-to-paperless/...` war in diesem Setup die funktionierende Lösung.
 - Die Seiten mussten in diesem konkreten Setup **um 180° gedreht** und die **Seitenreihenfolge komplett umgedreht** werden, damit das PDF korrekt war.
 - Die Ghostscript-basierte Leerseitenerkennung über `inkcov` war mit gräulichem Umweltpapier in diesem Setup nicht zuverlässig; deshalb ist `REMOVE_BLANK_PAGES="false"` der aktuell gewählte stabile Stand.
 - Das NFS-Ziel war für `saned:scanner` bereits schreibbar; `chgrp` auf dem Client war auf dem NFS-Mount nicht erlaubt. Das ist normal und muss bei Bedarf serverseitig gelöst werden.
+- Die neue Queue trennt **physisches Scannen** von **PDF-Verarbeitung und Upload**. Dadurch ist das Hauptproblem gelöst, dass ein weiterer Scan erst nach kompletter PDF-Nachbearbeitung möglich war.
 
 ---
 
@@ -280,7 +283,7 @@ Ein `chgrp` auf dem NFS-Mount vom Pi aus war **nicht erlaubt**, was bei NFS norm
 
 ---
 
-## 9. Die zwei zentralen Dateien installieren
+## 9. Die zentralen Dateien installieren
 
 ### 9.1 Script installieren
 
@@ -288,15 +291,14 @@ Ein `chgrp` auf dem NFS-Mount vom Pi aus war **nicht erlaubt**, was bei NFS norm
 
 Das Script soll:
 
-- Duplex scannen
-- TIFFs in PDF umwandeln
-- PDF um 180° drehen
-- Seitenreihenfolge umkehren
-- fertiges PDF in den NFS-Consume-Ordner legen
+- per `scanbd` einen Scanjob enqueuen
+- die rohen TIFF-Seiten pro Job lokal ablegen
+- per Hintergrund-Worker PDF-Erzeugung und Upload ausführen
+- Profile über die Function-Taste des Fujitsu auswählen
+- einen kompakten Status der Queue ausgeben
 
 Wichtig:
-- Lock-Datei **nicht** unter `/run`, sondern unter `/var/lib/scan-to-paperless/...`
-- `load_config` muss vor dem Öffnen der Lock-Datei aufgerufen werden
+- Lock-Dateien **nicht** unter `/run`, sondern unter `/var/lib/scan-to-paperless/...`
 - das Script muss unter dem Benutzerkontext `saned:scanner` funktionieren
 
 Installieren:
@@ -318,9 +320,20 @@ sudo install -m 0644 scan-to-paperless.conf /etc/scan-to-paperless.conf
 ### 9.3 Arbeitsverzeichnisse anlegen und Rechte setzen
 
 ```bash
-sudo mkdir -p /var/lib/scan-to-paperless/spool /var/lib/scan-to-paperless/archive
+sudo mkdir -p /var/lib/scan-to-paperless/{incoming,queue,processing,failed,spool,archive}
 sudo chgrp -R scanner /var/lib/scan-to-paperless
 sudo chmod -R 2775 /var/lib/scan-to-paperless
+```
+
+### 9.4 Worker-Service installieren
+
+`/etc/systemd/system/scan-to-paperless-worker.service`
+
+Installieren:
+
+```bash
+sudo install -m 0644 scan-to-paperless-worker.service /etc/systemd/system/scan-to-paperless-worker.service
+sudo systemctl daemon-reload
 ```
 
 ---
@@ -333,10 +346,21 @@ Der verifizierte funktionierende Stand war:
 LOG_TAG="scan-to-paperless"
 FILE_PREFIX="import"
 KEEP_LOCAL_COPY="false"
+STATE_DIR="/var/lib/scan-to-paperless"
 LOCK_FILE="/var/lib/scan-to-paperless/scan-to-paperless.lock"
+WORKER_LOCK_FILE="/var/lib/scan-to-paperless/scan-to-paperless-worker.lock"
 
+INCOMING_DIR="/var/lib/scan-to-paperless/incoming"
+QUEUE_DIR="/var/lib/scan-to-paperless/queue"
+PROCESSING_DIR="/var/lib/scan-to-paperless/processing"
+FAILED_DIR="/var/lib/scan-to-paperless/failed"
 SPOOL_DIR="/var/lib/scan-to-paperless/spool"
 ARCHIVE_DIR="/var/lib/scan-to-paperless/archive"
+
+MAX_RETRIES="3"
+RETRY_DELAY_MINUTES="5"
+WORKER_IDLE_SECONDS="5"
+STATUS_LIST_LIMIT="5"
 
 SCAN_DEVICE="fujitsu:fi-6130dj:455167"
 SCAN_SOURCE="ADF Duplex"
@@ -358,6 +382,59 @@ REVERSE_PAGE_ORDER="true"
 
 EXPECTED_SCANBD_ACTION_REGEX="^scan$"
 
+PROFILE_FROM_SCANBD_FUNCTION="true"
+PROFILE_DEFAULT_KEY="1"
+FUNCTION_C_VALUES="10 C c"
+
+PROFILE_1_LABEL="Gray Duplex 300dpi"
+PROFILE_1_SOURCE="ADF Duplex"
+PROFILE_1_MODE="Gray"
+PROFILE_1_RESOLUTION="300"
+
+PROFILE_2_LABEL="Gray Single 300dpi"
+PROFILE_2_SOURCE="ADF Back"
+PROFILE_2_MODE="Gray"
+PROFILE_2_RESOLUTION="300"
+
+PROFILE_3_LABEL="Color Duplex 300dpi"
+PROFILE_3_SOURCE="ADF Duplex"
+PROFILE_3_MODE="Color"
+PROFILE_3_RESOLUTION="300"
+
+PROFILE_4_LABEL="Color Single 300dpi"
+PROFILE_4_SOURCE="ADF Back"
+PROFILE_4_MODE="Color"
+PROFILE_4_RESOLUTION="300"
+
+PROFILE_5_LABEL="Lineart Duplex 300dpi"
+PROFILE_5_SOURCE="ADF Duplex"
+PROFILE_5_MODE="Lineart"
+PROFILE_5_RESOLUTION="300"
+
+PROFILE_6_LABEL="Lineart Single 300dpi"
+PROFILE_6_SOURCE="ADF Back"
+PROFILE_6_MODE="Lineart"
+PROFILE_6_RESOLUTION="300"
+
+PROFILE_7_LABEL="Gray Single 600dpi"
+PROFILE_7_SOURCE="ADF Back"
+PROFILE_7_MODE="Gray"
+PROFILE_7_RESOLUTION="600"
+
+PROFILE_8_LABEL="Color Single 600dpi"
+PROFILE_8_SOURCE="ADF Back"
+PROFILE_8_MODE="Color"
+PROFILE_8_RESOLUTION="600"
+
+PROFILE_9_LABEL="Lineart Single 600dpi"
+PROFILE_9_SOURCE="ADF Back"
+PROFILE_9_MODE="Lineart"
+PROFILE_9_RESOLUTION="600"
+
+EMBED_PROFILE_TEXT_LAYER="true"
+INVISIBLE_TEXT_PREFIX="paperless-skip-ocr"
+INVISIBLE_TEXT_TEMPLATE=""
+
 UPLOAD_METHOD="filesystem"
 TARGET_DIR="/mnt/paperless-consume"
 TARGET_SUBDIR=""
@@ -375,6 +452,10 @@ SFTP_CREATE_REMOTE_DIR="false"
 
 ### Warum genau diese Werte?
 
+- `STATE_DIR` und die Unterverzeichnisse bilden das persistente Queue-Modell.
+- `LOCK_FILE` schützt nur den **physischen Scanlauf**, nicht mehr die komplette Verarbeitung.
+- `WORKER_LOCK_FILE` stellt sicher, dass nur ein Worker gleichzeitig verarbeitet.
+- `MAX_RETRIES="3"` und `RETRY_DELAY_MINUTES="5"` sind ein pragmatischer Standard für temporäre Ziel- oder Netzwerkfehler.
 - `SCAN_DEVICE` ist fest gesetzt, damit nicht versehentlich ein anderer Scanner gewählt wird.
 - `ADF Duplex` ist der gewünschte Scanmodus.
 - `Gray` mit `300` dpi war der ausgewogene, funktionierende Standard.
@@ -382,8 +463,9 @@ SFTP_CREATE_REMOTE_DIR="false"
 - `PDF_ROTATION="180"` war nötig, weil die Seiten im konkreten Einzug kopfstehend ankamen.
 - `REVERSE_PAGE_ORDER="true"` war nötig, weil der Dokumentstapel sonst im PDF hinten nach vorne ankam.
 - `REMOVE_BLANK_PAGES="false"` ist aktuell der stabile Stand, weil die `inkcov`-Methode mit dem verwendeten gräulichen Papier keine brauchbare Leerseitenerkennung ergab.
+- `PROFILE_FROM_SCANBD_FUNCTION="true"` erlaubt die Profilwahl `1..9` direkt über die Function-Taste am Scanner.
 - `UPLOAD_METHOD="filesystem"` plus NFS-Mount war die gewählte funktionierende Übergabe.
-- `LOCK_FILE` liegt bewusst unter `/var/lib/scan-to-paperless/...`, damit `saned:scanner` ihn anlegen kann.
+- `EMBED_PROFILE_TEXT_LAYER="true"` kann Paperless/OCRmyPDF im Skip-Modus helfen, das PDF als bereits mit Text versehen zu behandeln.
 
 ---
 
@@ -419,10 +501,10 @@ sudo SCANBD_ACTION=scan /usr/local/bin/scan-to-paperless.sh
 Noch besser ist der Test im späteren echten `scanbd`-Benutzerkontext:
 
 ```bash
-sudo -u saned -g scanner env SCANBD_ACTION=scan /usr/local/bin/scan-to-paperless.sh
+sudo -u saned -g scanner env SCANBD_ACTION=scan SCANBD_FUNCTION=1 /usr/local/bin/scan-to-paperless.sh
 ```
 
-**Dieser Test funktionierte in diesem Setup** und war der Beweis, dass Script, Rechte und NFS-Ziel im `scanbd`-Kontext passen.
+Dieser Test legt jetzt **einen Queue-Job** an. Der eigentliche PDF-Workflow läuft anschließend über den Worker.
 
 ---
 
@@ -554,6 +636,11 @@ action scan {
 }
 ```
 
+Wichtig:
+
+- `scanbd` darf hier **keine Argumente** wie `enqueue` anhängen, da `scanbd` den String direkt als Executable-Pfad ausführt.
+- Das ist in Ordnung, weil `/usr/local/bin/scan-to-paperless.sh` standardmäßig `enqueue` ausführt.
+
 Die Debug-Ausgabe hat im funktionierenden Setup klar gezeigt:
 
 - `scanbd` erkennt die Aktion `scan`
@@ -628,10 +715,12 @@ Paperless dokumentiert, dass damit statt inotify eine periodische Prüfung des C
 
 ## 16. Endgültige Inbetriebnahme
 
-### 16.1 Dienst starten
+### 16.1 Dienste starten
 
 ```bash
+sudo systemctl enable --now scan-to-paperless-worker.service
 sudo systemctl enable --now scanbd
+sudo systemctl restart scan-to-paperless-worker.service
 sudo systemctl restart scanbd
 ```
 
@@ -644,6 +733,12 @@ journalctl -u scanbd -f
 ```
 
 Im zweiten:
+
+```bash
+journalctl -u scan-to-paperless-worker.service -f
+```
+
+Im dritten:
 
 ```bash
 journalctl -t scan-to-paperless -f
@@ -660,13 +755,17 @@ Im `scanbd`-Log:
 - Trigger für Aktion `scan`
 - Script `/usr/local/bin/scan-to-paperless.sh` wird gestartet
 
-Im `scan-to-paperless`-Log:
+Im `scan-to-paperless`-Log direkt nach dem Buttondruck:
 
 - `Starte Scan ...`
+- `Scan erfolgreich in Warteschlange gelegt ...`
+
+Im Worker-Log:
+
 - `PDF um 180 Grad gedreht`
 - `PDF-Seitenreihenfolge umgekehrt`
 - `Datei bereitgestellt unter /mnt/paperless-consume/...`
-- `Workflow erfolgreich abgeschlossen`
+- `Job erfolgreich verarbeitet ...`
 
 **Genau dieser Zustand wurde in diesem Setup erreicht.**
 
@@ -710,6 +809,16 @@ Ursache:
 Lösung:
 - `script = "/usr/local/bin/scan-to-paperless.sh"`
 
+### Problem: Taste wird erkannt, aber `scanbd` meldet `access/stat/execlp: No such file or directory`
+Ursache:
+- in `scanbd.conf` wurde fälschlich ein String mit Argumenten gesetzt, z. B. `"/usr/local/bin/scan-to-paperless.sh enqueue"`
+
+Lösung:
+- `scanbd`-Script-Eintrag nur auf den Pfad setzen:
+  ```conf
+  script = "/usr/local/bin/scan-to-paperless.sh"
+  ```
+
 ### Problem: Script läuft manuell, aber nicht unter `scanbd`
 Ursache:
 - Lock-Datei lag zuerst unter `/run/...`
@@ -720,8 +829,17 @@ Lösung:
 - Rechte auf `/var/lib/scan-to-paperless/...` für Gruppe `scanner`
 - Test mit:
   ```bash
-  sudo -u saned -g scanner env SCANBD_ACTION=scan /usr/local/bin/scan-to-paperless.sh
+  sudo -u saned -g scanner env SCANBD_ACTION=scan SCANBD_FUNCTION=1 /usr/local/bin/scan-to-paperless.sh
   ```
+
+### Problem: Scanner ist nach Tastendruck zu lange blockiert
+Ursache:
+- das alte Script verarbeitete PDF-Erzeugung, Rotation und Upload synchron im gleichen Lauf wie den physischen Scan
+
+Lösung:
+- Queue-basiertes Script mit separatem Worker-Service verwenden
+- `scanbd` startet nur noch das Enqueueing
+- der Worker verarbeitet Jobs danach FIFO im Hintergrund
 
 ### Problem: PDF war auf dem Kopf
 Lösung:
@@ -761,13 +879,25 @@ scanimage -A -d 'fujitsu:fi-6130dj:455167'
 
 ```bash
 sudo systemctl stop scanbd
-sudo SCANBD_ACTION=scan /usr/local/bin/scan-to-paperless.sh
+sudo SCANBD_ACTION=scan SCANBD_FUNCTION=1 /usr/local/bin/scan-to-paperless.sh
 ```
 
 ### Script im echten `scanbd`-Benutzerkontext testen
 
 ```bash
-sudo -u saned -g scanner env SCANBD_ACTION=scan /usr/local/bin/scan-to-paperless.sh
+sudo -u saned -g scanner env SCANBD_ACTION=scan SCANBD_FUNCTION=1 /usr/local/bin/scan-to-paperless.sh
+```
+
+### Queue-Status prüfen
+
+```bash
+/usr/local/bin/scan-to-paperless.sh status
+```
+
+### Worker einmalig abarbeiten lassen
+
+```bash
+/usr/local/bin/scan-to-paperless.sh worker --once
 ```
 
 ### `scanbd`-eigene SANE-Konfiguration testen
@@ -812,16 +942,19 @@ Für den Alltag ist der stabilste, in diesem Setup funktionierende Stand:
 - Fujitsu fi-6130 über SANE `fujitsu`
 - `scanbd` mit eigener SANE-Konfiguration
 - `scanbd`-Action auf `/usr/local/bin/scan-to-paperless.sh`
+- separater `scan-to-paperless-worker.service`
 - Upload per NFS in den echten Host-Consume-Ordner
 - `SCAN_MODE="Gray"`
 - `SCAN_RESOLUTION="300"`
 - `REMOVE_BLANK_PAGES="false"`
 - `PDF_ROTATION="180"`
 - `REVERSE_PAGE_ORDER="true"`
+- Profilwahl `1..9` über die Function-Taste
+- Queueing mit FIFO-Verarbeitung und Retry
 
 Damit war der komplette Pfad funktionsfähig:
 
-**Taste drücken → ADF Duplex scannen → PDF erzeugen → drehen → Seitenreihenfolge korrigieren → im Consume-Ordner ablegen → Paperless importiert.**
+**Taste drücken → ADF Duplex physisch scannen → Job in Queue legen → Worker erzeugt PDF → drehen → Seitenreihenfolge korrigieren → im Consume-Ordner ablegen → Paperless importiert.**
 
 ---
 
@@ -838,7 +971,8 @@ Wenn dieses README auf einen neuen Raspberry Pi angewendet wird, ist die empfohl
 7. Script **ohne `scanbd`** direkt testen
 8. `scanbd`-eigene SANE-Konfiguration aufbauen
 9. `scanbd.conf` auf das echte Script umstellen
-10. `scanbd` im Foreground debuggen
-11. Dienst aktivieren und Button testen
+10. Worker-Service installieren und starten
+11. `scanbd` im Foreground debuggen
+12. Dienste aktivieren und Button testen
 
 Genau dieser Weg hat in diesem Setup zum funktionierenden Endzustand geführt.
